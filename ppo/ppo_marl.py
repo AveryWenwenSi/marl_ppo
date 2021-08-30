@@ -1405,7 +1405,7 @@ class PPOTrainer:
             print("Loading training policy from: {}".format(train_model_path))
 
     def my_vis(self):
-        self.load_saved_policies("ppo/ppo_policies/self_play")
+        self.load_saved_policies("ppo/ppo_policies/multi_agent")
         time_step = self.eval_env.reset()
         i = 0
         isopen = True
