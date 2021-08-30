@@ -93,7 +93,7 @@ class PPOTrainer:
         log_interval (int):  Metrics and results are logged to tensorboard
             (if enabled) every log_interval epochs.
     """
-    def __init__(self, ppo_agents, train_env, eval_env, size=(96, 96),
+    def __init__(self, ppo_agents, train_env, gym_eval_env, size=(96, 96),
                  normalize=True, num_frames=1, num_channels=3,
                  use_tensorboard=True, add_to_video=True,
                  use_separate_agents=False, use_self_play=False,
@@ -105,7 +105,10 @@ class PPOTrainer:
 
         # Environment attributes
         self.train_env = train_env  # Environment for training
+        py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
+        eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
         self.eval_env = eval_env  # Environment for testing
+        self.py_eval_env = gym_eval_env
 
         # Observation attributes
         self.size = size
@@ -1401,6 +1404,34 @@ class PPOTrainer:
             self.collect_policy = tf.saved_model.load(train_model_path)
             print("Loading training policy from: {}".format(train_model_path))
 
+    def my_vis(self):
+        self.load_saved_policies("ppo/ppo_policies/self_play")
+        time_step = self.eval_env.reset()
+        i = 0
+        isopen = True
+        stopped = False
+        while isopen and not stopped:
+            # Create empty list of actions
+            actions = []
+            # Get all agent time steps
+            agent_timesteps = self.get_agent_timesteps(time_step, step=i)
+            # Iterate through cars and select actions
+            for car_id in range(self.num_agents):
+                agent_ts = agent_timesteps[car_id]
+                action_step = self.eval_policies[car_id].action(agent_ts)
+                actions.append(action_step.action)
+            # Create the tf action tensor
+            action_tensor = tf.convert_to_tensor([tf.stack(tuple(actions), axis=1)])
+            # Step through with all actions
+            s, r, done, infos = self.py_eval_env.step(action_tensor) 
+            i += 1
+            isopen = self.py_eval_env.render().all()
+            if stopped or done or isopen == False:
+                break   
+
+        self.py_eval_env.close()
+
+
 
 def parse_args():
     """Argument-parsing function for running this code."""
@@ -1492,9 +1523,9 @@ def main():
     """ Main function for creating a PPO agent and training it on the
     multi-player OpenAI Gym Car Racing simulator.
     """
-    if USE_XVFB:  # Headless render\
-        wrapper = Xvfb()
-        wrapper.start()
+    # if USE_XVFB:  # Headless render\
+    #     wrapper = Xvfb()
+    #     wrapper.start()
 
     # Read in arguments from command line.
     if USE_CLI:
@@ -1533,17 +1564,19 @@ def main():
                                        h_ratio=H_RATIO,
                                        use_ego_color=USE_EGO_COLOR)
 
+    # gym_eval_env.render()
 
     gym_train_env.observation_space.dtype = np.float32  # For Conv2D data input
     gym_eval_env.observation_space.dtype = np.float32  # For Conv2D data input
 
     # Now create Python environment from gym env
     py_train_env = gym_wrapper.GymWrapper(gym_train_env)  # Gym --> Py
-    py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
+    
 
     # Create training and evaluation TensorFlow environments
     tf_train_env = tf_py_environment.TFPyEnvironment(py_train_env)  # Py --> Tf
-    tf_eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
+    # py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
+    # tf_eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
 
     # Display environment specs
     print("Observation spec: {} \n".format(tf_train_env.observation_spec()))
@@ -1572,7 +1605,7 @@ def main():
                 agents[i].initialize()
 
         # Instantiate the trainer
-        trainer = PPOTrainer(agents, tf_train_env, tf_eval_env, size=args.size,
+        trainer = PPOTrainer(agents, tf_train_env, gym_eval_env, size=args.size,
                              normalize=args.normalize, num_frames=args.num_frames,
                              num_channels=args.num_channels,
                              use_tensorboard=args.use_tensorboard,
@@ -1611,7 +1644,7 @@ def main():
                 agents[i].initialize()
 
         # Instantiate the trainer
-        trainer = PPOTrainer(agents, tf_train_env, tf_eval_env, size=SIZE,
+        trainer = PPOTrainer(agents, tf_train_env, gym_eval_env, size=SIZE,
                              normalize=NORMALIZE, num_frames=NUM_FRAMES,
                              num_channels=NUM_CHANNELS,
                              use_tensorboard=USE_TENSORBOARD,
@@ -1631,15 +1664,17 @@ def main():
     print("Initialized agent, beginning training...")
 
     # Train agent, and when finished, save model
-    trained_agent = trainer.train_agent()
+    # trained_agent = trainer.train_agent()
 
     # Plot the total returns for all agents
-    trainer.plot_eval()
+    # trainer.plot_eval()
 
-    print("Training finished; saving agent...")
+    # print("Training finished; saving agent...")
 
-    trainer.save_policies()
-    print("Policies saved.")
+    # trainer.save_policies()
+    # print("Policies saved.")
+    trainer.my_vis()
+
 
     if USE_XVFB:  # Headless render
         wrapper.stop()
