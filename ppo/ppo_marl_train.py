@@ -1422,7 +1422,7 @@ class PPOTrainer:
 
         # Training loop
         for i in range(self.epochs):
-            print("Epochs: ", i)
+
             # Train for maximum number of steps
             if self.global_step >= self.total_steps:
                 print("Reached the end of training with {} training steps".format(self.global_step))
