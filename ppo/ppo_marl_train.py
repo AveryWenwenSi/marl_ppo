@@ -2,7 +2,7 @@
 using the TensorFlow Agents API. """
 
 # Native Python imports
-import os, pdb
+import os
 import argparse
 from datetime import datetime
 import pickle
@@ -20,7 +20,6 @@ import cv2 as cv
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 # Custom modules
 from utils import ObservationWrapper, video_summary, make_agent
@@ -94,7 +93,7 @@ class PPOTrainer:
         log_interval (int):  Metrics and results are logged to tensorboard
             (if enabled) every log_interval epochs.
     """
-    def __init__(self, ppo_agents, train_env, gym_eval_env, size=(96, 96),
+    def __init__(self, ppo_agents, train_env, eval_env, size=(96, 96),
                  normalize=True, num_frames=1, num_channels=3,
                  use_tensorboard=True, add_to_video=True,
                  use_separate_agents=False, use_self_play=False,
@@ -106,10 +105,7 @@ class PPOTrainer:
 
         # Environment attributes
         self.train_env = train_env  # Environment for training
-        py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
-        eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
         self.eval_env = eval_env  # Environment for testing
-        self.py_eval_env = gym_eval_env
 
         # Observation attributes
         self.size = size
@@ -954,9 +950,7 @@ class PPOTrainer:
                 actions = []
 
                 # Get all agent time steps
-                agent_timesteps = self.get_agent_timesteps(time_step, step=i, ego_car_index=ego_car_index,
-                                                     only_ego_car=False,
-                                                     max_steps=self.collect_steps_per_episode-1)
+                agent_timesteps = self.get_agent_timesteps(time_step, step=i)
 
                 # Iterate through cars and select actions
                 for car_id in range(NUM_AGENTS):
@@ -1318,7 +1312,7 @@ class PPOTrainer:
         # If final, just use 'FINAL'
         if is_final:
             epochs_done = "FINAL"
-
+        custom_path = None
         # Multiple PPO agents
         if self.use_separate_agents:
 
@@ -1335,8 +1329,7 @@ class PPOTrainer:
                                                   "agent_{}".format(i))
                 if not os.path.exists(train_save_dir):
                     os.makedirs(train_save_dir, exist_ok=True)
-                train_saver.save_weights(train_save_dir)
-                # train_saver.save(train_save_dir)
+                train_saver.save(train_save_dir)
 
             print("Training policies saved...")
 
@@ -1347,8 +1340,7 @@ class PPOTrainer:
                                              "agent_{}".format(i))
                 if not os.path.exists(eval_save_dir):
                     os.makedirs(eval_save_dir, exist_ok=True)
-                eval_saver.save_weights(eval_save_dir)
-                # eval_saver.save(eval_save_dir)
+                eval_saver.save(eval_save_dir)
 
             print("Eval policies saved...")
 
@@ -1395,35 +1387,124 @@ class PPOTrainer:
         if train_model_path is not None:
             self.collect_policy = tf.saved_model.load(train_model_path)
             print("Loading training policy from: {}".format(train_model_path))
-       
-    def my_vis(self):
-        self.load_saved_policies("/home/wenwens/software/marl_ppo_origin/ppo/models/frame_stack_self_play_20210831-2056/train/epochs_1")
-        time_step = self.eval_env.reset()
-        i = 0
-        isopen = True
-        stopped = False
-        while isopen and not stopped:
-            # Create empty list of actions
-            actions = []
-            # Get all agent time steps
-            agent_timesteps = self.get_agent_timesteps(time_step, step=i)
-            # Iterate through cars and select actions
+
+    def train_adversarial(self):
+        self.load_saved_policies("ppo/ppo_policies/multi_agent")
+        eval_epochs = []
+
+        # Optimize by wrapping some of the code in a graph using TF function.
+        if self.use_separate_agents:
             for car_id in range(self.num_agents):
-                agent_ts = agent_timesteps[car_id]
-                print(agent_ts)
-                action_step = self.eval_policies[car_id].action(agent_ts)
-                actions.append(action_step.action)
-            # Create the tf action tensor
-            action_tensor = tf.convert_to_tensor([tf.stack(tuple(actions), axis=1)])
-            # Step through with all actions
-            s, r, done, infos = self.py_eval_env.step(action_tensor) 
-            i += 1
-            isopen = self.py_eval_env.render().all()
-            if stopped or done or isopen == False:
-                break   
+                self.agents[car_id].train = common.function(self.agents[car_id].train)
+                self.agents[car_id].train_step_counter.assign(0)
 
-        self.py_eval_env.close()
+        # should include other car crush 
+        avg_return = self.compute_average_reward(ego_car_index=0)
 
+        # Log average training return to tensorboard
+        if self.use_tensorboard:
+            with self.tb_file_writer.as_default():
+                tf.summary.scalar("Average Eval Reward", float(avg_return),
+                                  step=self.global_step)
+
+        print("DONE WITH PRELIMINARY EVALUATION...")
+
+        # Append for output plot, create video, and empty eval video array
+        eval_epochs.append(0)
+        self.create_video(mode='eval', ext=0)
+        self.video_eval = []  # Empty to create a new eval video
+        returns = [avg_return]
+
+        # Reset the environment time step and global and episode step counters
+        time_step = self.train_env.reset()
+        step = 0
+        i = 0
+
+        # Training loop
+        for i in range(self.epochs):
+            print("Epochs: ", i)
+            # Train for maximum number of steps
+            if self.global_step >= self.total_steps:
+                print("Reached the end of training with {} training steps".format(self.global_step))
+                break
+
+            # Set the agent index for the ego car for this epoch
+            # train on only the 0 car
+            # ego_car_index = i % self.num_agents
+            ego_car_index = 0
+            print("Training epoch: {}".format(i))
+
+            # Collect trajectories for current ego car (rotates each epoch)
+            print("Collecting episode for car with ID {}".format(ego_car_index))
+
+            # Reset the old training video
+            self.video_train = []
+
+            # Collect data for car index i % self.num_agents
+
+            self.collect_episode(epoch=i, ego_car_index=ego_car_index)
+            print("No LSTM")
+
+            # Create a training episode video every 100 episodes
+            if i % 100 == 0 and self.add_to_video:
+                self.create_video(mode='train', ext=i)  # Create video of training
+            print("Collected Episode")
+
+            # Whether or not to do an optimization step with the GPU
+            if self.use_gpu:
+                device = '/gpu:0'
+            else:
+                device = '/cpu:0'
+
+            # Do computation on selected device above
+            with tf.device(device):
+
+                # Gather trajectories from replay buffer
+                trajectories = self.replay_buffer.gather_all()
+
+                # Train on N different PPO agents
+                if self.use_separate_agents:
+
+                    # Take training step - with observations and rewards of ego agent
+                    train_loss = self.agents[ego_car_index].train(experience=trajectories)
+                    # Step the counter, and log/evaluate agent
+                    step = self.agents[ego_car_index].train_step_counter.numpy()
+
+            with tf.device('/cpu:0'):
+
+                if self.global_step % self.log_interval == 0:
+                    print('step = {0}: loss = {1}'.format(self.global_step,
+                                                          train_loss.loss))
+
+                if i % self.eval_interval == 0:
+                    avg_return = self.compute_average_reward(ego_car_index=ego_car_index)
+                    # Log average eval return to tensorboard and store it
+                    if self.use_tensorboard:
+                        with self.tb_file_writer.as_default():
+                            tf.summary.scalar("Average Eval Reward",
+                                              float(avg_return),
+                                              step=self.global_step)
+                    eval_epochs.append(i + 1)
+                    print(
+                        'epoch = {0}: Average Return = {1}'.format(step, avg_return))
+                    returns.append(avg_return)
+                    if self.add_to_video:
+                        self.create_video(mode='eval', ext=i)
+                    self.video_eval = []  # Empty to create a new eval video
+
+                # Save checkpoints every save_interval epochs
+                if i % self.save_interval == 0 and i != 0:
+                    self.save_policies(epochs_done=i)
+                    print("Epochs: {}".format(i))
+
+                # Clear the replay buffer for the next episode
+                self.replay_buffer.clear()
+
+        # At the end of training, return the agent(s)
+        if self.use_separate_agents:
+            return self.agents
+        else:
+            return self.agent
 
 def parse_args():
     """Argument-parsing function for running this code."""
@@ -1512,13 +1593,12 @@ def parse_args():
 
 
 def main():
-    import pdb
     """ Main function for creating a PPO agent and training it on the
     multi-player OpenAI Gym Car Racing simulator.
     """
-    # if USE_XVFB:  # Headless render\
-    #     wrapper = Xvfb()
-    #     wrapper.start()
+    if USE_XVFB:  # Headless render\
+        wrapper = Xvfb()
+        wrapper.start()
 
     # Read in arguments from command line.
     if USE_CLI:
@@ -1557,19 +1637,17 @@ def main():
                                        h_ratio=H_RATIO,
                                        use_ego_color=USE_EGO_COLOR)
 
-    # gym_eval_env.render()
 
     gym_train_env.observation_space.dtype = np.float32  # For Conv2D data input
     gym_eval_env.observation_space.dtype = np.float32  # For Conv2D data input
 
     # Now create Python environment from gym env
     py_train_env = gym_wrapper.GymWrapper(gym_train_env)  # Gym --> Py
-    
+    py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
 
     # Create training and evaluation TensorFlow environments
     tf_train_env = tf_py_environment.TFPyEnvironment(py_train_env)  # Py --> Tf
-    # py_eval_env = gym_wrapper.GymWrapper(gym_eval_env)    # Gym --> Py
-    # tf_eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
+    tf_eval_env = tf_py_environment.TFPyEnvironment(py_eval_env)    # Py --> Tf
 
     # Display environment specs
     print("Observation spec: {} \n".format(tf_train_env.observation_spec()))
@@ -1598,7 +1676,7 @@ def main():
                 agents[i].initialize()
 
         # Instantiate the trainer
-        trainer = PPOTrainer(agents, tf_train_env, gym_eval_env, size=args.size,
+        trainer = PPOTrainer(agents, tf_train_env, tf_eval_env, size=args.size,
                              normalize=args.normalize, num_frames=args.num_frames,
                              num_channels=args.num_channels,
                              use_tensorboard=args.use_tensorboard,
@@ -1637,7 +1715,7 @@ def main():
                 agents[i].initialize()
 
         # Instantiate the trainer
-        trainer = PPOTrainer(agents, tf_train_env, gym_eval_env, size=SIZE,
+        trainer = PPOTrainer(agents, tf_train_env, tf_eval_env, size=SIZE,
                              normalize=NORMALIZE, num_frames=NUM_FRAMES,
                              num_channels=NUM_CHANNELS,
                              use_tensorboard=USE_TENSORBOARD,
@@ -1658,19 +1736,15 @@ def main():
 
     # Train agent, and when finished, save model
     # trained_agent = trainer.train_agent()
+    trained_agent = trainer.train_adversarial()
 
     # Plot the total returns for all agents
-    # trainer.plot_eval()
+    trainer.plot_eval()
 
-    # print("Training finished; saving agent...")
+    print("Training finished; saving agent...")
 
-    # trainer.save_policies()
-    # print("Policies saved.")
-    # eval_policy = tf.saved_model.load("ppo_policies/multi_agent")
-    # pdb.set_trace()
-
-    trainer.my_vis()
-
+    trainer.save_policies()
+    print("Policies saved.")
 
     if USE_XVFB:  # Headless render
         wrapper.stop()
